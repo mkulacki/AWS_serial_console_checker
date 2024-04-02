@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  Prefix:
+    Type: String
+    Default: mk-trailcf
+    Description: Prefix to use in the names of Resources
+  AppStack:
+    Type: String
+    Default: Mkulacki
+    Description: app resources will be easier to find
+  MetricName:
+    Type: String
+    Default: SerialConsoleEventsCount
+    Description: default metric name for this excercise  
+  MetricNamespace:
+    Type: String
+    Default: CloudTrailMetrics
+    Description: Default Metric namespace for metricfilter
+  LambdaPermissionCheckerTimeout:
+    Type: Number
+    Default: 30
+    Description: Adjust if lambda takes longer due to bigger user/role pool
+
+Resources:
+  TrailS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Prefix}-bucket"
+      Tags:
+        - Key: AppStack
+          Value: !Sub "${AppStack}"
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: 
+        Ref: TrailS3Bucket
+      PolicyDocument: 
+        Statement: 
+          - 
+            Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal: 
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: 
+              !Sub |-
+                arn:aws:s3:::${TrailS3Bucket}
+          - 
+            Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal: 
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource:
+              !Sub |-
+                arn:aws:s3:::${TrailS3Bucket}/AWSLogs/${AWS::AccountId}/*
+            Condition: 
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  TrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+      Tags:
+        - Key: AppStack
+          Value: !Sub "${AppStack}"
+          
+  TrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${Prefix}-log-group"
+      RetentionInDays: 3
+      Tags:
+        - Key: AppStack
+          Value: !Sub "${AppStack}"
+
+  TrailTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "TrailTopic"
+      TopicName: "TrailTopic"
+      Tags:
+        - Key: AppStack
+          Value: !Sub "${AppStack}"
+
+  TrailMetricFilterOn:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ $.eventName="EnableSerialConsoleAccess"}'
+      MetricTransformations:
+        - MetricName: !Ref MetricName
+          MetricNamespace: !Ref MetricNamespace
+          MetricValue: '1'
+
+  TrailMetricFilterOff:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterPattern: '{ $.eventName="DisableSerialConsoleAccess"}'
+      MetricTransformations:
+        - MetricName: !Ref MetricName
+          MetricNamespace: !Ref MetricNamespace
+          MetricValue: '0'
+
+  TrailAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: "SerialConsoleEventsENABLED"
+      AlarmDescription: "Alarm for SerialConsoleEvents"
+      Namespace: !Ref MetricNamespace
+      MetricName: !Ref MetricName
+      Statistic: Sum
+      Period: 30
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: ignore
+      AlarmActions:
+        - !GetAtt TrailPermissionCheckerLambda.Arn
+        - !GetAtt TrailDisableSerialConsoleLambda.Arn
+
+  CloudTrail:
+    DependsOn: 
+    - TrailLogGroup
+    - TrailBucketPolicy
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub "${Prefix}-trail"
+      S3BucketName: !Ref TrailS3Bucket
+      IsLogging: true 
+      CloudWatchLogsLogGroupArn: !GetAtt TrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt TrailLogsRole.Arn
+      Tags:
+        - Key: AppStack
+          Value: !Sub "${AppStack}"
+
+####################     PERMISSION CHECKER LAMBDA   ################
+
+  PermissionCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MyLambdaLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:SimulateCustomPolicy
+                Resource: "*"
+      Tags:
+        - Key: AppStack
+          Value: !Sub "${AppStack}"
+
+  TrailPermissionCheckerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt PermissionCheckerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          def simulate_policy_for_all_users():
+              iam = boto3.client('iam')
+              users = iam.list_users()['Users']
+              policy = {
+                  'Version': '2012-10-17',
+                  'Statement': [{
+                      'Effect': 'Allow',
+                      'Action': 'ec2:EnableSerialConsoleAccess',
+                      'Resource': '*'  # Assuming you want to check against all resources
+                  }]
+              }
+              policy_json = json.dumps(policy)
+              
+              for user in users:
+                  user_arn = user['Arn']
+                  response = iam.simulate_custom_policy(
+                      PolicyInputList = [policy_json],
+                      ActionNames=['ec2:EnableSerialConsoleAccess'],
+                      CallerArn=user_arn
+                      )
+                      
+              user_simulation_results = []     
+              all_users_simulation_results = []
+              for result in response['EvaluationResults']:
+                  user_simulation_results.append({
+                      'Action': result['EvalActionName'],
+                      'Resource': result['EvalResourceName'],
+                      'Decision': result['EvalDecision']
+                  })
+                
+              all_users_simulation_results.append({
+                  'User': user['UserName'],
+                  'SimulationResults': user_simulation_results
+              })
+              
+              return all_users_simulation_results
+              
+          def lambda_handler(event, context):
+              results = simulate_policy_for_all_users()
+              logger.info(results)
+              return results
+      Runtime: python3.12
+      Timeout: !Ref LambdaPermissionCheckerTimeout
+
+  TrailPermissionCheckerPermission: 
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt TrailPermissionCheckerLambda.Arn
+      Principal: 'lambda.alarms.cloudwatch.amazonaws.com'
+
+####################     Disable Serial Console LAMBDA   ################
+  DisablerSCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MyLambdaLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:DisableSerialConsoleAccess
+                Resource: "*"
+      Tags:
+        - Key: AppStack
+          Value: !Sub "${AppStack}"
+
+  TrailDisableSerialConsoleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt DisablerSCRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          def lambda_handler(event, context):
+              ec2_client = boto3.client('ec2')
+              response = ec2_client.disable_serial_console_access()
+              logger.info(response)
+              results = response
+              return results
+      Runtime: python3.12
+  TrailDisableSerialConsolePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt TrailDisableSerialConsoleLambda.Arn
+      Principal: 'lambda.alarms.cloudwatch.amazonaws.com'
+
+
